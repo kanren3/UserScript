@@ -321,6 +321,8 @@
     backup_stream: "0",
     csrf_token: "",
     csrf: "",
+    build: "1234",
+    version: "1.0.0",
   };
 
   // 停止直播数据模板
@@ -1154,6 +1156,22 @@
     }
   }
 
+  function appsign(params, appkey, appsec) {
+    params.appkey = appkey;
+
+    const sortedKeys = Object.keys(params).sort();
+    const sortedParams = {};
+    sortedKeys.forEach((key) => {
+      sortedParams[key] = params[key];
+    });
+
+    const query = new URLSearchParams(sortedParams).toString();
+    const sign = window.crypto.subtle.digest("MD5", new TextEncoder().encode(query + appsec))
+
+    params.sign = sign;
+    return params;
+  }
+
   // 开始直播
   async function startLive() {
     // 获取输入值
@@ -1187,11 +1205,15 @@
         return;
       }
 
+      const app_key = "aae92bc66f3edfab";
+      const app_sec = "af125a0d5279fd576c1b4418a3e8276d";
+
       // 设置请求参数
       startData.room_id = roomId;
       startData.csrf_token = csrf;
       startData.csrf = csrf;
       startData.area_v2 = areaId;
+      const signedStartData = appsign(startData, app_key, app_sec);
 
       // 获取推流码
       showMessage("正在获取推流码...");
@@ -1200,7 +1222,7 @@
         method: "POST",
         url: API_URL_START_LIVE,
         headers: headers,
-        data: new URLSearchParams(startData).toString(),
+        data: new URLSearchParams(signedStartData).toString(),
       });
 
       const startLiveResult = JSON.parse(startLiveResponse.responseText);
