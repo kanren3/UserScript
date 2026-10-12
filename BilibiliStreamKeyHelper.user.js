@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站推流码获取工具
 // @namespace    https://github.com/smathsp
-// @version      1.14
+// @version      1.15
 // @description  获取第三方推流码
 // @author       smathsp
 // @license      GPL-3.0
@@ -15,6 +15,12 @@
 // @grant        GM_notification
 // @connect      api.live.bilibili.com
 // @connect      passport.bilibili.com
+// @connect      api.bilibili.com
+// @connect      data.bilibili.com
+// @connect      *.bilivideo.com
+// @connect      *.biliapi.net
+// @connect      *.bilibili.com
+// @connect      tcdns.myqcloud.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js
 // @run-at       document-end
 // ==/UserScript==
@@ -34,11 +40,13 @@
     AREA_LIST: "bili_area_list",
     USER_MID: "bili_user_mid",
     LAST_TITLE: "bili_last_title",
+    BUVID: "bili_native_buvid",
+    BUVID_SOURCE: "bili_native_buvid_source",
   };
 
   // API URL Constants
   const API_URL_AREA_LIST =
-    "https://api.live.bilibili.com/room/v1/Area/getList?show_pinyin=1";
+    "https://api.live.bilibili.com/xlive/app-blink/v1/preLive/GetAreaListForLive";
   const API_URL_START_LIVE =
     "https://api.live.bilibili.com/room/v1/Room/startLive";
   const API_URL_UPDATE_ROOM =
@@ -47,18 +55,294 @@
     "https://api.live.bilibili.com/room/v1/Room/stopLive";
   const API_URL_FACE_AUTH =
     "https://api.live.bilibili.com/xlive/app-blink/v1/preLive/IsUserIdentifiedByFaceAuth";
+  const API_URL_NAV = "https://api.bilibili.com/x/web-interface/nav";
+  const API_URL_ROOM_INFO =
+    "https://api.live.bilibili.com/xlive/app-blink/v1/room/GetInfo";
+  const API_URL_PRECHECK =
+    "https://api.live.bilibili.com/xlive/app-blink/v1/preLive/PreCheck";
+  const API_URL_PRELIVE =
+    "https://api.live.bilibili.com/xlive/app-blink/v1/preLive/PreLive";
 
-  // 将 GM_xmlhttpRequest Promise 化
+  const LIVEHIME = Object.freeze({
+    appkey: "aae92bc66f3edfab",
+    platform: "pc_link",
+    version: "8.8.0.11119",
+    build: "11119",
+    salt: "af125a0d5279fd576c1b4418a3e8276d",
+    userAgent: "LiveHime/8.8.0.11119 os/Windows pc_app/livehime build/11119 osVer/10_0",
+  });
+
+  function protocolError(kind, message, details = {}) {
+    return Object.assign(new Error(message), { kind }, details);
+  }
+
+  function requireProtocolString(value, label, allowEmpty = true) {
+    if (typeof value !== "string" || (!allowEmpty && value.length === 0) || value.includes("\0")) {
+      throw protocolError("validation", `${label} 必须是${allowEmpty ? "" : "非空"}字符串且不能包含 NUL`);
+    }
+    // encodeURIComponent rejects unpaired UTF-16 surrogates instead of replacing them.
+    try {
+      encodeURIComponent(value);
+    } catch (cause) {
+      throw protocolError("validation", `${label} 包含无效 Unicode 字符`, { cause });
+    }
+    return value;
+  }
+
+  function protocolEntries(params) {
+    if (params === null || typeof params !== "object" || Object.prototype.toString.call(params) !== "[object Object]") {
+      throw protocolError("validation", "参数必须是 string -> string 对象映射");
+    }
+    return Reflect.ownKeys(params).map((key) => {
+      requireProtocolString(key, "参数名", false);
+      const descriptor = Object.getOwnPropertyDescriptor(params, key);
+      if (!descriptor.enumerable || !("value" in descriptor)) {
+        throw protocolError("validation", "参数必须是可枚举的字符串数据属性");
+      }
+      return [key, requireProtocolString(descriptor.value, `参数 ${key}`)];
+    });
+  }
+
+  function serializeParams(params) {
+    const encoder = new TextEncoder();
+    const entries = protocolEntries(params).map(([key, value]) => ({ key, value, bytes: encoder.encode(key) }));
+    entries.sort((left, right) => {
+      const length = Math.min(left.bytes.length, right.bytes.length);
+      for (let i = 0; i < length; i++) {
+        if (left.bytes[i] !== right.bytes[i]) return left.bytes[i] - right.bytes[i];
+      }
+      return left.bytes.length - right.bytes.length;
+    });
+    // Its safe set is exactly A-Z a-z 0-9 ! ' ( ) * - . _ ~; spaces stay %20.
+    return entries.map(({ key, value }) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join("&");
+  }
+
+  const MD5_SHIFTS = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+  const MD5_CONSTANTS = new Uint32Array([
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+  ]);
+
+  function md5Ascii(text) {
+    if (typeof text !== "string") throw protocolError("validation", "MD5 输入必须是 ASCII 字符串");
+    const bytes = new Uint8Array(Math.ceil((text.length + 9) / 64) * 64);
+    for (let i = 0; i < text.length; i++) {
+      const byte = text.charCodeAt(i);
+      if (byte > 0x7f) throw protocolError("validation", "MD5 输入必须是 ASCII 字符串");
+      bytes[i] = byte;
+    }
+    bytes[text.length] = 0x80;
+    const view = new DataView(bytes.buffer);
+    view.setUint32(bytes.length - 8, (text.length * 8) >>> 0, true);
+    view.setUint32(bytes.length - 4, Math.floor(text.length / 0x20000000), true);
+    let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+    for (let offset = 0; offset < bytes.length; offset += 64) {
+      let a = a0, b = b0, c = c0, d = d0;
+      for (let i = 0; i < 64; i++) {
+        let f, word;
+        if (i < 16) {
+          f = (b & c) | (~b & d);
+          word = i;
+        } else if (i < 32) {
+          f = (d & b) | (~d & c);
+          word = (5 * i + 1) % 16;
+        } else if (i < 48) {
+          f = b ^ c ^ d;
+          word = (3 * i + 5) % 16;
+        } else {
+          f = c ^ (b | ~d);
+          word = (7 * i) % 16;
+        }
+        const shift = MD5_SHIFTS[(i >>> 4) * 4 + (i % 4)];
+        const sum = (a + f + MD5_CONSTANTS[i] + view.getUint32(offset + word * 4, true)) | 0;
+        a = d;
+        d = c;
+        c = b;
+        b = (b + ((sum << shift) | (sum >>> (32 - shift)))) | 0;
+      }
+      a0 = (a0 + a) | 0;
+      b0 = (b0 + b) | 0;
+      c0 = (c0 + c) | 0;
+      d0 = (d0 + d) | 0;
+    }
+    let hex = "";
+    for (const word of [a0, b0, c0, d0]) {
+      for (let shift = 0; shift < 32; shift += 8) hex += ((word >>> shift) & 0xff).toString(16).padStart(2, "0");
+    }
+    return hex;
+  }
+
+  function signParams(params) {
+    if (params !== null && typeof params === "object" && Object.prototype.hasOwnProperty.call(params, "sign")) {
+      throw protocolError("validation", "待签名参数不能包含 sign");
+    }
+    return md5Ascii(serializeParams(params) + LIVEHIME.salt);
+  }
+
+  function requirePositiveDecimal(value, label) {
+    requireProtocolString(value, label, false);
+    if (!/^[1-9][0-9]*(?![\s\S])/.test(value)) throw protocolError("validation", `${label} 必须是十进制正整数字符串`);
+    return value;
+  }
+
+  function commonParams(full = true, ts = String(Math.floor(Date.now() / 1000))) {
+    const params = { appkey: LIVEHIME.appkey, platform: LIVEHIME.platform, ts: requirePositiveDecimal(ts, "ts") };
+    if (full) Object.assign(params, { version: LIVEHIME.version, build: LIVEHIME.build, access_key: "" });
+    return params;
+  }
+
+  function buildStartLiveBody(roomId, areaId, csrf, orientation = "landscape", ts = String(Math.floor(Date.now() / 1000))) {
+    if (orientation !== "landscape" && orientation !== "portrait") throw protocolError("validation", "直播方向必须是 landscape 或 portrait");
+    const params = {
+      ...commonParams(true, ts),
+      room_id: requirePositiveDecimal(roomId, "room_id"),
+      area_v2: requirePositiveDecimal(areaId, "area_v2"),
+      type: orientation === "landscape" ? "2" : "1",
+      csrf: requireProtocolString(csrf, "csrf", false),
+      csrf_token: csrf,
+    };
+    return serializeParams({ ...params, sign: signParams(params) });
+  }
+
+  function buildStopLiveBody(roomId, csrf, ts = String(Math.floor(Date.now() / 1000))) {
+    const params = { ...commonParams(true, ts), room_id: requirePositiveDecimal(roomId, "room_id") };
+    requireProtocolString(csrf, "csrf", false);
+    // stopLive differs from startLive: both CSRF fields are appended AFTER signing.
+    return serializeParams({ ...params, sign: signParams(params), csrf, csrf_token: csrf });
+  }
+
+  // GM manages applicable browser cookies; never construct a Cookie header here.
   function gmRequest(options) {
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        ...options,
-        onload: resolve,
-        onerror: reject,
-        ontimeout: reject,
-        onabort: reject,
-      });
+      try {
+        GM_xmlhttpRequest({
+          ...options,
+          timeout: Number.isFinite(options.timeout) && options.timeout > 0 ? options.timeout : 15000,
+          onload: resolve,
+          onerror: (cause) => reject(protocolError("network", "网络请求失败", { cause })),
+          ontimeout: (cause) => reject(protocolError("timeout", "网络请求超时", { cause })),
+          onabort: (cause) => reject(protocolError("abort", "请求已取消", { cause })),
+        });
+      } catch (cause) {
+        reject(protocolError("request", "无法创建网络请求", { cause }));
+      }
     });
+  }
+
+  function validateBuvid(value) {
+    if (typeof value !== "string" || value.length < 1 || value.length > 4096 || /[^\x21-\x7e]/.test(value)) {
+      throw protocolError("device", "原生 buvid 格式损坏：需要 1–4096 个 ASCII 可见字符");
+    }
+    return value;
+  }
+
+  function fallbackBuvid() {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    // Browsers cannot obtain the native OS PID; decimal 0 is our explicit browser adaptation.
+    return `${uuid}0user`;
+  }
+
+  let buvidInitialization = null;
+  async function ensureBuvid() {
+    if (buvidInitialization) return buvidInitialization;
+    const cached = GM_getValue(STORAGE_KEYS.BUVID, undefined);
+    if (cached !== undefined) return validateBuvid(cached);
+    buvidInitialization = (async () => {
+      let value, source;
+      try {
+        // No account cookies, buvid, signing parameters, or JSON parsing during device discovery.
+        const response = await gmRequest({ method: "GET", url: "https://data.bilibili.com/gv", anonymous: true });
+        if (response.status !== 200) throw protocolError("http", `设备接口 HTTP ${response.status}`, { status: response.status });
+        value = validateBuvid(response.responseText);
+        source = "remote-gv";
+      } catch (error) {
+        if (!["http", "network", "timeout"].includes(error.kind)) throw error;
+        value = fallbackBuvid();
+        source = "local-uuid-v4-browser-pid-0";
+      }
+      GM_setValue(STORAGE_KEYS.BUVID_SOURCE, source);
+      GM_setValue(STORAGE_KEYS.BUVID, value);
+      return value;
+    })();
+    try {
+      return await buvidInitialization;
+    } finally {
+      buvidInitialization = null;
+    }
+  }
+
+  async function getApiHeaders() {
+    return {
+      "User-Agent": LIVEHIME.userAgent,
+      Referer: "https://live.bilibili.com/",
+      Accept: "application/json",
+      buvid: await ensureBuvid(),
+    };
+  }
+
+  async function sendJsonRequest(options, apiHeaders, checkCode) {
+    const headers = {};
+    for (const [key, value] of Object.entries(options.headers || {})) {
+      const lower = key.toLowerCase();
+      if (lower === "cookie") throw protocolError("validation", "Cookie 必须由 GM 浏览器会话管理");
+      if (!["user-agent", "referer", "accept", "buvid", "host", "content-length", "content-type"].includes(lower)) headers[key] = value;
+    }
+    Object.assign(headers, apiHeaders);
+    if ((options.method || "GET").toUpperCase() === "POST") headers["Content-Type"] = "application/x-www-form-urlencoded";
+    const response = await gmRequest({ ...options, headers });
+    if (response.status !== 200) throw protocolError("http", `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`, { status: response.status });
+    let result;
+    try {
+      result = JSON.parse(response.responseText);
+    } catch (cause) {
+      throw protocolError("json", "服务器返回无效 JSON", { cause });
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result) || typeof result.code !== "number" || !Number.isFinite(result.code)) {
+      throw protocolError("json", "服务器 JSON 缺少有效业务 code", { response: result });
+    }
+    if (checkCode && result.code !== 0) {
+      const messages = [result.msg, result.message].filter((value) => typeof value === "string" && value.length > 0);
+      throw protocolError("business", `业务错误 ${result.code}${messages.length ? `：${[...new Set(messages)].join("；")}` : ""}`, { code: result.code, response: result });
+    }
+    return result;
+  }
+
+  async function requestJson(options, checkCode = true) {
+    return sendJsonRequest(options, await getApiHeaders(), checkCode);
+  }
+
+  async function signedRequest(method, url, fields = {}, { full = true, afterSign = {}, checkCode = true } = {}) {
+    if (method !== "GET" && method !== "POST") throw protocolError("validation", "签名请求仅支持 GET 或 POST");
+    const entries = protocolEntries(fields);
+    const extraEntries = protocolEntries(afterSign);
+    const reserved = new Set(["appkey", "platform", "ts", "version", "build", "access_key", "sign"]);
+    for (const [key] of entries) {
+      if (reserved.has(key)) throw protocolError("validation", `业务参数不能覆盖 ${key}`);
+      reserved.add(key);
+    }
+    for (const [key] of extraEntries) {
+      if (reserved.has(key)) throw protocolError("validation", `签名后参数不能覆盖 ${key}`);
+    }
+    const headers = await getApiHeaders();
+    // Timestamp is sampled only after potentially slow device initialization is complete.
+    const params = { ...commonParams(full), ...Object.fromEntries(entries) };
+    const encoded = serializeParams({ ...params, sign: signParams(params), ...Object.fromEntries(extraEntries) });
+    if (method === "GET") {
+      const target = new URL(url);
+      if (target.search || target.hash) throw protocolError("validation", "签名接口 URL 不能预含 query 或 fragment");
+      return sendJsonRequest({ method, url: `${url}?${encoded}` }, headers, checkCode);
+    }
+    return sendJsonRequest({ method, url, data: encoded }, headers, checkCode);
   }
 
   // SVG 图标常量
@@ -328,62 +612,23 @@
   let isLiveStarted = GM_getValue(STORAGE_KEYS.IS_LIVE_STARTED, false); // 直播状态
   let streamInfo = GM_getValue(STORAGE_KEYS.STREAM_INFO, null); // 推流信息缓存
 
-  // 请求头
-  const headers = {
-    accept: "application/json, text/plain, */*",
-    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-    origin: "https://link.bilibili.com",
-    referer: "https://link.bilibili.com/p/center/index",
-    "user-agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "buvid": "9f63aebd-847b-4ccd-b1b5-6d03be1ada1b28716user"
-  };
+  let liveOperationPending = false;
+  let liveStatusUnknown = GM_getValue("bili_live_status_unknown", false);
+  let faceAuthCancelled = false;
 
-  // 开始直播数据模板
-  const startData = {
-    room_id: "",
-    platform: "pc_link", //感谢bilibili Z-Lake提供
-    area_v2: "",
-    backup_stream: "0",
-    csrf_token: "",
-    csrf: "",
-  };
+  function saveLiveState(isLive, unknown = false) {
+    isLiveStarted = isLive;
+    liveStatusUnknown = unknown;
+    GM_setValue(STORAGE_KEYS.IS_LIVE_STARTED, isLive);
+    GM_setValue("bili_live_status_unknown", unknown);
+    if (!isLive) {
+      streamInfo = null;
+      GM_setValue(STORAGE_KEYS.STREAM_INFO, null);
+    }
+    updateButtonsForLive(isLive);
+  }
 
-  // 停止直播数据模板
-  const stopData = {
-    room_id: "",
-    platform: "pc_link", //感谢bilibili Z-Lake提供
-    csrf_token: "",
-    csrf: "",
-  };
 
-  // 修改直播标题数据模板
-  const titleData = {
-    room_id: "",
-    platform: "pc_link", //感谢bilibili Z-Lake提供
-    title: "",
-    csrf_token: "",
-    csrf: "",
-  };
-
-  // 修改直播分区数据模板
-  const areaData = {
-    room_id: "",
-    platform: "pc_link", //感谢bilibili Z-Lake提供
-    area_id: "",
-    csrf_token: "",
-    csrf: "",
-  };
-
-  // 人脸验证数据模板
-  const faceAuthData = {
-    room_id: "",
-    face_auth_code: "60024",
-    csrf_token: "",
-    csrf: "",
-    visit_id: "",
-  };
 
   // 初始化入口
   function init() {
@@ -392,6 +637,7 @@
       removeExistingComponents(); // 清理旧组件
       createUI(); // 创建UI（只创建一次主面板）
       restoreLiveState(); // 恢复直播状态
+      updateButtonsForLive(isLiveStarted);
     } catch (error) {
       console.error("B站推流码获取工具初始化失败:", error);
     }
@@ -440,6 +686,8 @@
           top: 70px;
           right: 10px;
           width: 240px;
+          max-height: calc(100vh - 110px);
+          overflow-y: auto;
           z-index: 10000;
           display: none;
       `;
@@ -593,6 +841,15 @@
     // 标题输入
     form.appendChild(createTitleInput());
 
+    const orientation = document.createElement("select");
+    orientation.id = "bili-orientation";
+    orientation.className = "bili-select";
+    orientation.setAttribute("aria-label", "直播方向");
+    orientation.append(new Option("横屏直播", "landscape"), new Option("竖屏直播", "portrait"));
+    orientation.value = GM_getValue("bili_orientation", "landscape");
+    orientation.onchange = () => GM_setValue("bili_orientation", orientation.value);
+    form.appendChild(orientation);
+
     // 按钮组
     form.appendChild(createButtonGroup());
 
@@ -611,7 +868,7 @@
     const input = document.createElement("input");
     input.type = "text";
     input.id = "bili-room-id";
-    input.placeholder = "请输入你的房间ID";
+    input.placeholder = "留空自动查询本人房间";
     input.className = "bili-input";
     // 新增：输入时保存
     input.addEventListener("blur", function () {
@@ -674,7 +931,7 @@
         loading.style.color === "rgb(255, 75, 75)" ||
         loading.style.color === "#ff4b4b"
       ) {
-        loadAndBindAreaList();
+        loadAndBindAreaList().catch(() => {}); // 错误已显示在加载控件中
       }
     };
 
@@ -735,42 +992,30 @@
     }
 
     // 加载分区数据
-    function loadAndBindAreaList() {
-      return new Promise(async (resolve, reject) => {
-        // 返回 Promise
-        loading.style.display = "block";
-        groupSelect.style.display = "none";
-        areaSelect.style.display = "none";
-        loading.textContent = "正在加载分区列表...";
-        loading.style.color = "#666";
-        const cachedList = getCachedAreaList();
-        if (cachedList) {
-          updateAreaSelectors(cachedList, 0, groupSelect, areaSelect);
-          resolve(); // 解析 Promise
-          return;
-        }
-        try {
-          const response = await gmRequest({
-            method: "GET",
-            url: API_URL_AREA_LIST,
-            headers: headers,
+    async function loadAndBindAreaList() {
+      loading.style.display = "block";
+      groupSelect.style.display = "none";
+      areaSelect.style.display = "none";
+      loading.textContent = "正在加载分区列表...";
+      loading.style.color = "#666";
+      try {
+        let list = getCachedAreaList();
+        if (!list) {
+          const result = await signedRequest("GET", API_URL_AREA_LIST, {
+            current_area_id: String(GM_getValue(STORAGE_KEYS.LAST_AREA_ID, "0")),
           });
-          const result = JSON.parse(response.responseText);
-          if (result.code === 0) {
-            cacheAreaList(result.data);
-            updateAreaSelectors(result.data, 0, groupSelect, areaSelect);
-            resolve(); // 解析 Promise
-          } else {
-            console.error("Area list API error:", result);
-            showAreaLoadError();
-            reject(new Error("Failed to load area list")); // 拒绝 Promise
+          list = Array.isArray(result.data) ? result.data : result.data?.list;
+          if (!Array.isArray(list) || !list.every((group) => Array.isArray(group.list))) {
+            throw new Error("分区目录格式异常");
           }
-        } catch (errorResponse) {
-          console.error("Area list request error:", errorResponse);
-          showAreaLoadError();
-          reject(errorResponse); // 拒绝 Promise
+          cacheAreaList(list);
         }
-      });
+        updateAreaSelectors(list, 0, groupSelect, areaSelect);
+      } catch (error) {
+        showAreaLoadError();
+        loading.textContent = `分区加载失败：${error.message}（点击重试）`;
+        throw error;
+      }
     }
 
     // 将 Promise 附加到容器元素，以便在 createUI 中访问
@@ -894,62 +1139,86 @@
   }
 
   // 检查实际直播状态
-  async function checkActualLiveStatus() {
-    if (!roomId || !csrf) return;
-
+  async function checkActualLiveStatus(force = false) {
+    if (liveOperationPending && !force) return;
+    if (!force) {
+      liveOperationPending = true;
+      updateButtonsForLive(isLiveStarted);
+    }
     try {
-      const response = await gmRequest({
-        method: "POST",
-        url: "https://api.live.bilibili.com/room/v1/Room/get_info",
-        headers: headers,
-        data: new URLSearchParams({ room_id: roomId }).toString(),
-      });
-
-      const result = JSON.parse(response.responseText);
-      if (result.code === 0 && result.data) {
-        const actualLiveStatus = result.data.live_status; // 0=未开播，1=直播中，2=轮播中
-
-        // 检查本地状态与实际状态是否一致
-        if (isLiveStarted && actualLiveStatus !== 1) {
-          // 本地认为在直播，但实际未直播 - 状态不一致
-          console.log("检测到直播状态不一致：本地显示直播中，但服务器显示未直播");
-
-          // 更新本地状态
-          isLiveStarted = false;
-          streamInfo = null;
-          GM_setValue(STORAGE_KEYS.IS_LIVE_STARTED, false);
-          GM_setValue(STORAGE_KEYS.STREAM_INFO, null);
-
-          // 更新UI
-          updateButtonsForLive(false);
-
-          // 清除结果区域或显示提示
-          const resultArea = document.getElementById("bili-result");
-          if (resultArea) {
-            resultArea.innerHTML = `<div class="bili-tip-yellow"><span style="font-weight:bold;">提示：</span>检测到该房间直播已被结束，已自动更新状态</div>`;
-            resultArea.style.display = "block";
-          }
-
-          // 显示通知
-          GM_notification({
-            text: "检测到直播已结束，状态已同步",
-            title: "B站推流码获取工具",
-            timeout: 5000,
-          });
-        } else if (!isLiveStarted && actualLiveStatus === 1) {
-          // 本地认为未直播，但实际在直播 - 可能是其他地方开启的直播
-          console.log("检测到可能存在其他地方开启的直播");
-
-          const resultArea = document.getElementById("bili-result");
-          if (resultArea) {
-            resultArea.innerHTML = `<div class="bili-tip-yellow"><span style="font-weight:bold;">提示：</span>检测到该房间正在直播中，可能是通过其他方式开启的</div>`;
-            resultArea.style.display = "block";
-          }
-        }
-      }
+      const ownRoom = await getOwnRoom();
+      const changed = isLiveStarted !== (ownRoom.live_status === 1) || liveStatusUnknown;
+      saveLiveState(ownRoom.live_status === 1);
+      if (changed) showMessage(isLiveStarted ? "服务器确认房间正在直播" : "服务器确认房间未开播");
+      return ownRoom;
     } catch (error) {
-      console.error("检查直播状态失败:", error);
-      // 静默失败，不影响正常使用
+      showMessage(`无法确认房间状态：${error.message}`, true);
+      return null;
+    } finally {
+      if (!force) {
+        liveOperationPending = false;
+        updateButtonsForLive(isLiveStarted);
+      }
+    }
+  }
+
+  async function getOwnRoom(expectedRoomId = "") {
+    const nav = await signedRequest("GET", API_URL_NAV, {}, { full: false });
+    if (nav.data?.isLogin !== true || !/^[1-9]\d*$/.test(String(nav.data.mid))) {
+      throw new Error("请先登录 B 站");
+    }
+    const mid = String(nav.data.mid);
+    const result = await signedRequest("GET", API_URL_ROOM_INFO, { uId: mid });
+    const data = result.data;
+    if (!data || !/^[1-9]\d*$/.test(String(data.room_id))) throw new Error("当前账号没有有效直播间");
+    if (data.uid !== undefined && String(data.uid) !== mid) throw new Error("直播间不属于当前登录账号");
+    const ownId = String(data.room_id);
+    if (expectedRoomId && expectedRoomId !== ownId) throw new Error(`请输入本人真实房间 ID：${ownId}`);
+    if (![0, 1, 2].includes(data.live_status)) throw new Error("房间直播状态无法识别，停止操作");
+    if (roomId !== ownId) {
+      streamInfo = null;
+      GM_setValue(STORAGE_KEYS.STREAM_INFO, null);
+    }
+    roomId = ownId;
+    GM_setValue(STORAGE_KEYS.LAST_ROOM_ID, roomId);
+    GM_setValue(STORAGE_KEYS.USER_MID, mid);
+    const input = document.getElementById("bili-room-id");
+    if (input) input.value = roomId;
+    return data;
+  }
+
+  function requireCsrf() {
+    csrf = getCsrfToken();
+    if (!csrf) throw new Error("无法获取 bili_jct，请在已登录的 B 站页面操作");
+    return csrf;
+  }
+
+  async function preflightStart(expectedRoomId, areaId, title) {
+    requireCsrf();
+    const ownRoom = await getOwnRoom(expectedRoomId);
+    saveLiveState(ownRoom.live_status === 1);
+    if (isLiveStarted) throw new Error("房间已在直播，请勿重复开播");
+    const locked = ownRoom.lock_status ?? ownRoom.is_locked;
+    if (locked !== 0 && locked !== false) throw new Error("直播间已锁定或无法确认锁定状态");
+    const areas = getCachedAreaList();
+    if (!/^[1-9]\d*$/.test(areaId) || !areas?.some((group) => group.list?.some((area) => String(area.id) === areaId))) {
+      throw new Error("请选择有效的二级直播分区");
+    }
+    const token = requireCsrf();
+    const check = await signedRequest("GET", API_URL_PRECHECK, {}, {
+      full: false, afterSign: { csrf: token, csrf_token: token },
+    });
+    if (check.data?.realname_status !== 1) throw new Error("请先在官方直播中心完成实名认证");
+    if (!await updateLiveTitle(roomId, title)) throw new Error("设置直播标题失败，已停止开播");
+    const preLive = await signedRequest("GET", API_URL_PRELIVE, {}, {
+      afterSign: {
+        mobi_app: "pc_link", cover: "true", area: "true", title: "true",
+        schedule: "true", coverVertical: "true", liveDirectionType: "0",
+      },
+    });
+    const intercept = preLive.data?.cover_title_start_live_intercept;
+    if (intercept?.need_intercept !== false) {
+      throw new Error(intercept?.msg || intercept?.message || "标题／封面预检未通过，请前往官方直播中心完善设置");
     }
   }
 
@@ -1082,10 +1351,8 @@
     return GM_getValue(STORAGE_KEYS.LAST_ROOM_ID);
   }
   function getCsrfToken() {
-    const csrfCookie = document.cookie
-      .split("; ")
-      .find((row) => row.startsWith("bili_jct="));
-    return csrfCookie ? csrfCookie.split("=")[1] : null;
+    const cookie = document.cookie.split(";").map((item) => item.trim()).find((item) => item.startsWith("bili_jct="));
+    return cookie ? cookie.slice("bili_jct=".length) : null;
   }
   function autoFillRoomId() {
     const lastRoomId = GM_getValue(STORAGE_KEYS.LAST_ROOM_ID);
@@ -1128,79 +1395,14 @@
     csrf = getCsrfToken();
   }
 
-  // 恢复直播状态
-  function restoreLiveState() {
-    if (isLiveStarted && streamInfo) {
-      setTimeout(() => {
-        const panel = document.getElementById("bili-stream-code-panel");
-        if (panel) {
-          // 更新按钮状态
-          updateButtonsForLive(true);
-          // 恢复推流信息
-          restoreStreamInfo();
-        }
-      }, 500);
-    }
-  }
-
-  // 推流信息区输入框和按钮也用 class
-  function restoreStreamInfo() {
-    if (!streamInfo) return;
-    const resultArea = document.getElementById("bili-result");
-    if (!resultArea) return;
-    const rtmpAddr = streamInfo.rtmpAddr;
-    const rtmpCode = streamInfo.rtmpCode;
-
-    const resultHTML = `
-            <div style="display: flex; flex-direction: column; gap: 8px;">
-                <h3 class="bili-title" style="font-size: 16px;">推流信息 (进行中)</h3>
-                <div>
-                    <p style="margin: 0; font-weight: bold;">服务器地址:</p>
-                    <div style="display: flex; align-items: center; margin-bottom: 8px;">
-                        <input id="server-addr" readonly value="${rtmpAddr}" title="${rtmpAddr}" class="bili-input" />
-                        <button id="copy-addr" class="bili-copy-btn">复制</button>
-                    </div>
-                    <p style="margin: 0; font-weight: bold;">推流码:</p>
-                    <div style="display: flex; align-items: center;">
-                        <input id="stream-code" readonly value="${rtmpCode}" title="${rtmpCode}" class="bili-input" />
-                        <button id="copy-code" class="bili-copy-btn">复制</button>
-                    </div>
-                </div>
-                <div class="bili-important-tip">
-                    <p style="margin: 0; font-weight: bold;">重要提示:</p>
-                    <p style="margin: 3px 0 0; font-size: 13px;">1. 长时间无信号会自动关闭直播</p>
-                    <p style="margin: 3px 0 0; font-size: 13px;">2. 推流码如果变动会有提示</p>
-                </div>
-            </div>
-        `;
-
-    resultArea.innerHTML = resultHTML;
-    resultArea.style.display = "block";
-    // 添加复制按钮事件
-    const copyAddrBtn = document.getElementById("copy-addr");
-    if (copyAddrBtn) {
-      copyAddrBtn.addEventListener("click", function () {
-        copyToClipboardWithButton(rtmpAddr, copyAddrBtn);
-      });
-    }
-    const copyCodeBtn = document.getElementById("copy-code");
-    if (copyCodeBtn) {
-      copyCodeBtn.addEventListener("click", function () {
-        copyToClipboardWithButton(rtmpCode, copyCodeBtn);
-      });
-    }
-    // 新增：推流信息区插入后，重新应用颜色模式
-    const isDarkMode = GM_getValue("bili_dark_mode", false);
-    applyColorMode(isDarkMode);
-  }
 
   // 更新按钮状态（开始/结束直播）
   function updateButtonsForLive(isLive) {
     if (startLiveButton) {
-      startLiveButton.disabled = isLive;
+      startLiveButton.disabled = liveOperationPending || liveStatusUnknown || isLive;
     }
     if (stopLiveButton) {
-      stopLiveButton.disabled = !(roomId && String(roomId).trim() !== "");
+      stopLiveButton.disabled = liveOperationPending || !(isLive || liveStatusUnknown);
     }
     
     // 控制修改按钮的显示
@@ -1212,18 +1414,24 @@
         editButtonsContainer.style.display = "none";
       }
     }
+    for (const id of ["bili-room-id", "bili-area-group", "bili-area", "bili-title", "bili-orientation"]) {
+      const input = document.getElementById(id);
+      if (input) input.disabled = liveOperationPending || ((isLive || liveStatusUnknown) && id === "bili-room-id");
+    }
+    if (editTitleButton) editTitleButton.disabled = liveOperationPending;
+    if (editAreaButton) editAreaButton.disabled = liveOperationPending;
   }
 
   // 恢复直播状态
   function restoreLiveState() {
-    if (isLiveStarted && streamInfo) {
+    if (isLiveStarted || liveStatusUnknown) {
       setTimeout(() => {
         const panel = document.getElementById("bili-stream-code-panel");
         if (panel) {
           // 更新按钮状态
           updateButtonsForLive(true);
-          // 恢复推流信息
-          restoreStreamInfo();
+          if (streamInfo) restoreStreamInfo();
+          else showMessage(liveStatusUnknown ? "上次请求结果未知，打开面板查询房间状态" : "房间已开播，尚无可用推流地址");
         }
       }, 500);
     }
@@ -1243,12 +1451,12 @@
                 <div>
                     <p style="margin: 0; font-weight: bold;">服务器地址:</p>
                     <div style="display: flex; align-items: center; margin-bottom: 8px;">
-                        <input id="server-addr" readonly value="${rtmpAddr}" title="${rtmpAddr}" class="bili-input" />
+                        <input id="server-addr" readonly class="bili-input" />
                         <button id="copy-addr" class="bili-copy-btn">复制</button>
                     </div>
                     <p style="margin: 0; font-weight: bold;">推流码:</p>
                     <div style="display: flex; align-items: center;">
-                        <input id="stream-code" readonly value="${rtmpCode}" title="${rtmpCode}" class="bili-input" />
+                        <input id="stream-code" readonly class="bili-input" />
                         <button id="copy-code" class="bili-copy-btn">复制</button>
                     </div>
                 </div>
@@ -1261,6 +1469,11 @@
         `;
 
     resultArea.innerHTML = resultHTML;
+    for (const [id, value] of [["server-addr", rtmpAddr], ["stream-code", rtmpCode]]) {
+      const input = document.getElementById(id);
+      input.value = value;
+      input.title = value;
+    }
     resultArea.style.display = "block";
     // 添加复制按钮事件
     const copyAddrBtn = document.getElementById("copy-addr");
@@ -1309,7 +1522,7 @@
       }
     } catch (error) {
       console.error("修改标题错误:", error);
-      showMessage("修改直播标题时发生错误", true);
+      showMessage(`修改直播标题失败：${error.message}`, true);
     }
   }
 
@@ -1340,154 +1553,125 @@
       }
     } catch (error) {
       console.error("修改分区错误:", error);
-      showMessage("修改分区时发生错误", true);
+      showMessage(`修改直播分区失败：${error.message}`, true);
     }
   }
 
   // 开始直播
   async function startLive() {
-    // 获取输入值
-    roomId = document.getElementById("bili-room-id").value.trim();
+    if (liveOperationPending || isLiveStarted || liveStatusUnknown) return;
+    const expectedRoomId = document.getElementById("bili-room-id").value.trim();
     const areaId = document.getElementById("bili-area").value;
     const liveTitle = document.getElementById("bili-title").value.trim();
-
-    // 验证输入
-    if (!roomId) {
-      showMessage("请输入房间ID", true);
-      return;
-    }
-
-    if (!liveTitle) {
-      showMessage("请输入直播标题", true);
-      return;
-    }
-
-    if (!csrf) {
-      showMessage("无法获取CSRF令牌，请确保已登录B站", true);
-      return;
-    }
-
+    const orientation = document.getElementById("bili-orientation").value;
+    if (!liveTitle) return showMessage("请输入直播标题", true);
+    liveOperationPending = true;
+    updateButtonsForLive(isLiveStarted);
+    let sent = false;
     try {
-      const titleUpdated = await updateLiveTitle(roomId, liveTitle);
-      if (!titleUpdated) {
-        showMessage(
-          "设置直播标题失败，请确认是否已登录或有权限修改此直播间",
-          true
-        );
-        return;
-      }
-
-      // 设置请求参数
-      startData.room_id = roomId;
-      startData.csrf_token = csrf;
-      startData.csrf = csrf;
-      startData.area_v2 = areaId;
-
-      // 获取推流码
+      showMessage("正在检查登录、直播间及开播条件...");
+      await preflightStart(expectedRoomId, areaId, liveTitle);
+      const requestHeaders = await getApiHeaders();
+      const body = buildStartLiveBody(roomId, areaId, requireCsrf(), orientation);
       showMessage("正在获取推流码...");
-
-      const startLiveResponse = await gmRequest({
-        method: "POST",
-        url: API_URL_START_LIVE,
-        headers: headers,
-        data: new URLSearchParams(startData).toString(),
-      });
-
-      const startLiveResult = JSON.parse(startLiveResponse.responseText);
-
-      if (startLiveResult.code === 0) {
-        // 成功获取
-        handleStartLiveSuccess(startLiveResult.data, liveTitle, areaId);
-      } else if (startLiveResult.code === 60024 || (startLiveResult.data && startLiveResult.data.qr)) {
-        // 需要人脸验证
-        console.log("需要人脸验证:", startLiveResult);
-        showMessage("需要人脸验证，正在显示二维码...");
-        await handleFaceAuth(startLiveResult.data.qr, roomId, liveTitle, areaId);
+      sent = true;
+      // 在发送前持久化未知态，避免页面关闭后误以为请求未发生。
+      saveLiveState(false, true);
+      const result = await requestJson({
+        method: "POST", url: API_URL_START_LIVE, headers: requestHeaders, data: body,
+      }, false);
+      GM_setValue("bili_last_start_response", result);
+      saveLiveState(result.code === 0);
+      if ([60024, 60028, 60043].includes(result.code) || result.data?.need_face_auth || result.data?.qr) {
+        await handleFaceAuth(result);
+      } else if (result.code === 0) {
+        // 平台确认开播与地址解析是两个独立状态。
+        await handleStartLiveSuccess(result.data, liveTitle, areaId);
       } else {
-        console.error("Start live API error:", startLiveResult);
-        showMessage(
-          `获取推流码失败: ${startLiveResult.message || "未知错误"} (${startLiveResult.code})`,
-          true
-        );
+        showMessage(`开播失败：${businessMessage(result)}`, true);
+        showServerNotice(result.data?.notice);
       }
-    } catch (errorResponse) {
-      console.error("API request failed in startLive:", errorResponse);
-      let errorMessage = "网络请求失败或解析错误";
-      if (errorResponse && errorResponse.responseText) {
-        try {
-          const parsedError = JSON.parse(errorResponse.responseText);
-          errorMessage = `API错误: ${parsedError.message || "未知API错误"}`;
-        } catch (e) {}
-      } else if (errorResponse instanceof Error) {
-        errorMessage = `请求错误: ${errorResponse.message}`;
+    } catch (error) {
+      if (sent && liveStatusUnknown) {
+        const state = await checkActualLiveStatus(true);
+        showMessage(`开播请求结果未知（${error.message}）；${state ? (isLiveStarted ? "房间已在直播，但未取得推流地址" : "查询时房间未开播，可手动重试") : "状态查询失败，请到官方直播中心确认"}。未自动重发请求。`, true);
+      } else {
+        showMessage(`${isLiveStarted ? "房间已开播，但获取推流地址失败" : "开播已停止"}：${error.message}`, true);
+        if (sent) showServerNotice(GM_getValue("bili_last_start_response", null)?.data?.notice);
       }
-      showMessage(errorMessage, true);
+    } finally {
+      liveOperationPending = false;
+      updateButtonsForLive(isLiveStarted);
+    }
+  }
+
+  function businessMessage(result) {
+    const messages = [...new Set([result.msg, result.message].filter((value) => typeof value === "string" && value))];
+    return `${messages.join("；") || "未知错误"} (${result.code})`;
+  }
+
+  function officialUrl(value) {
+    try {
+      const url = new URL(value);
+      if (url.protocol === "https:" && !url.username && !url.password && (url.hostname === "bilibili.com" || url.hostname.endsWith(".bilibili.com"))) return url.href;
+    } catch (_) {}
+    return null;
+  }
+
+  function showServerNotice(notice, fallback = false) {
+    const result = document.getElementById("bili-result");
+    if (!result) return;
+    if (notice?.title || notice?.msg) {
+      const text = document.createElement("p");
+      text.textContent = [notice.title, notice.msg].filter(Boolean).join("：");
+      result.appendChild(text);
+    }
+    const url = officialUrl(notice?.button_url) || (fallback ? "https://link.bilibili.com/p/center/index" : null);
+    if (url) {
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = notice?.button_text || "前往官方直播中心完成验证";
+      result.appendChild(link);
     }
   }
 
   // 处理人脸验证
-  async function handleFaceAuth(qrUrl, roomId, title, areaId) {
-    if (!qrUrl) {
-      showMessage("未获取到人脸验证二维码", true);
+  async function handleFaceAuth(result) {
+    showMessage(`平台要求身份验证：${businessMessage(result)}`, true);
+    showServerNotice(result.data?.notice, true);
+    const qrUrl = officialUrl(result.data?.qr);
+    // 60043 的 voucher 由官方验证流程使用，不能伪装成 60024 轮询。
+    if (result.code === 60043) {
+      if (qrUrl) showQRCode(qrUrl);
       return;
     }
-
+    if (!qrUrl) return;
+    faceAuthCancelled = false;
+    showQRCode(qrUrl);
+    if (![60024, 60028].includes(result.code)) return;
+    const deadline = Date.now() + 60000;
     try {
-      // 显示二维码
-      showQRCode(qrUrl);
-      
-      // 设置人脸验证数据
-      faceAuthData.room_id = roomId;
-      faceAuthData.csrf_token = csrf;
-      faceAuthData.csrf = csrf;
-
-      // 轮询验证状态
-      let isVerified = false;
-      let attempts = 0;
-      const maxAttempts = 60; // 最多等待60秒
-
-      showMessage("请使用B站客户端扫描二维码进行人脸验证...");
-
-      while (!isVerified && attempts < maxAttempts) {
-        try {
-          const response = await gmRequest({
-            method: "POST",
-            url: API_URL_FACE_AUTH,
-            headers: headers,
-            data: new URLSearchParams(faceAuthData).toString(),
-          });
-
-          const result = JSON.parse(response.responseText);
-          
-          if (result.code === 0 && result.data && result.data.is_identified) {
-            isVerified = true;
-            hideQRCode();
-            showMessage("人脸验证成功，正在重新获取推流码...");
-            
-            // 验证成功后重新开始直播
-            await retryStartLive(roomId, title, areaId);
-            return;
-          }
-          
-          // 等待1秒后重试
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          attempts++;
-          
-        } catch (error) {
-          console.error("人脸验证状态检查失败:", error);
-          attempts++;
-          await new Promise(resolve => setTimeout(resolve, 1000));
+      while (!faceAuthCancelled && Date.now() < deadline) {
+        const token = requireCsrf();
+        const poll = await requestJson({
+          method: "POST", url: API_URL_FACE_AUTH,
+          data: serializeParams({ room_id: roomId, face_auth_code: String(result.code), csrf: token, csrf_token: token, visit_id: "" }),
+        });
+        if (faceAuthCancelled) return;
+        if (poll.data?.is_identified === true || poll.data?.is_identified === 1) {
+          hideQRCode();
+          showMessage(isLiveStarted ? "身份验证已通过，平台已确认开播；请到官方中心检查推流信息" : "身份验证已通过，请再次点击开播；将重新预检并生成签名");
+          return;
         }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-
-      // 超时处理
-      hideQRCode();
-      showMessage("人脸验证超时，请重试", true);
-      
+      if (!faceAuthCancelled) showMessage("验证等待超时，请到官方直播中心确认后手动开播", true);
     } catch (error) {
-      console.error("人脸验证处理失败:", error);
+      if (!faceAuthCancelled) showMessage(`身份验证状态查询失败：${error.message}`, true);
+    } finally {
       hideQRCode();
-      showMessage("人脸验证处理失败，请重试", true);
     }
   }
 
@@ -1538,7 +1722,7 @@
     `;
 
     const title = document.createElement('h3');
-    title.textContent = '人脸验证';
+    title.textContent = "身份验证";
     title.style.cssText = `
       margin: 0 0 15px 0;
       color: #fb7299;
@@ -1547,7 +1731,7 @@
     `;
     
     const instruction = document.createElement('p');
-    instruction.textContent = '请使用B站客户端扫描二维码进行人脸验证';
+    instruction.textContent = "请使用 B 站客户端扫描官方二维码完成验证";
     instruction.style.cssText = `
       margin: 0 0 20px 0;
       color: #666;
@@ -1599,82 +1783,23 @@
       }
     });
 
-    // 生成二维码
+    // 库不可用时仍提供同一官方链接，不泄露二维码凭据到控制台。
     try {
-      if (typeof QRCode !== 'undefined') {
-        console.log('QRCode库已加载');
-        console.log('qrUrl:', qrUrl);
-        console.log('QRCode.CorrectLevel:', QRCode.CorrectLevel);
-        
-        // 创建二维码 - 使用更兼容的方式
-        const qrcode = new QRCode(qrDiv, qrUrl);
-        
-        // 等待DOM更新后检查是否成功生成
-        setTimeout(() => {
-          if (qrDiv.innerHTML.trim() === '') {
-            console.log('⚠️ 二维码DOM为空，尝试备用方法');
-            // 备用方法：手动创建二维码
-            try {
-              qrDiv.innerHTML = '';
-              const qrcode2 = new QRCode(qrDiv, {
-                text: qrUrl,
-                width: 200,
-                height: 200,
-                colorDark: "#000000",
-                colorLight: "#ffffff"
-              });
-              
-              // 再次检查
-              setTimeout(() => {
-                if (qrDiv.innerHTML.trim() === '') {
-                  console.log('⚠️ 备用方法也失败，显示链接');
-                  qrDiv.innerHTML = `
-                    <p style="color: #666; font-size: 14px; line-height: 1.5; text-align: center;">
-                      二维码生成失败，请手动访问：<br>
-                      <a href="${qrUrl}" target="_blank" style="color: #fb7299; text-decoration: none; word-break: break-all;">${qrUrl}</a>
-                    </p>
-                  `;
-                } else {
-                  console.log('✅ 备用方法生成二维码成功');
-                }
-              }, 500);
-            } catch (backupError) {
-              console.error('备用二维码生成失败:', backupError);
-              qrDiv.innerHTML = `
-                <p style="color: #666; font-size: 14px; line-height: 1.5; text-align: center;">
-                  二维码生成失败，请手动访问：<br>
-                  <a href="${qrUrl}" target="_blank" style="color: #fb7299; text-decoration: none; word-break: break-all;">${qrUrl}</a>
-                </p>
-              `;
-            }
-          } else {
-            console.log('✅ 二维码生成成功');
-          }
-        }, 500);
-        
-      } else {
-        console.log('⚠️ QRCode库未加载，显示链接');
-        // 如果QRCode库未加载，显示链接
-        qrDiv.innerHTML = `
-          <p style="color: #666; font-size: 14px; line-height: 1.5; text-align: center;">
-            二维码库未加载，请手动访问：<br>
-            <a href="${qrUrl}" target="_blank" style="color: #fb7299; text-decoration: none; word-break: break-all;">${qrUrl}</a>
-          </p>
-        `;
-      }
-    } catch (error) {
-      console.error('生成二维码失败:', error);
-      qrDiv.innerHTML = `
-        <p style="color: #ff4b4b; font-size: 14px; line-height: 1.5; text-align: center;">
-          生成二维码失败，请手动访问：<br>
-          <a href="${qrUrl}" target="_blank" style="color: #fb7299; text-decoration: none; word-break: break-all;">${qrUrl}</a>
-        </p>
-      `;
+      if (typeof QRCode !== "undefined") new QRCode(qrDiv, { text: qrUrl, width: 200, height: 200 });
+    } catch (_) {
+      qrDiv.replaceChildren();
     }
+    const link = document.createElement("a");
+    link.href = qrUrl;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "打开官方验证链接";
+    qrContainer.insertBefore(link, closeBtn);
   }
 
   // 隐藏二维码
   function hideQRCode() {
+    faceAuthCancelled = true;
     const qrContainer = document.getElementById('bili-qr-container');
     const qrOverlay = document.getElementById('bili-qr-overlay');
     if (qrContainer) {
@@ -1685,234 +1810,128 @@
     }
   }
 
-  // 重试开始直播
-  async function retryStartLive(roomId, title, areaId) {
-    try {
-      // 重新设置开始直播数据
-      startData.room_id = roomId;
-      startData.csrf_token = csrf;
-      startData.csrf = csrf;
-      startData.area_v2 = areaId;
-
-      const response = await gmRequest({
-        method: "POST",
-        url: API_URL_START_LIVE,
-        headers: headers,
-        data: new URLSearchParams(startData).toString(),
-      });
-
-      const result = JSON.parse(response.responseText);
-
-      if (result.code === 0) {
-        handleStartLiveSuccess(result.data, title, areaId);
-      } else {
-        console.error("重试开始直播失败:", result);
-        showMessage(`重试开始直播失败: ${result.message || "未知错误"} (${result.code})`, true);
-      }
-    } catch (error) {
-      console.error("重试开始直播请求失败:", error);
-      showMessage("重试开始直播请求失败", true);
-    }
-  }
 
   // 处理开始直播成功
-  function handleStartLiveSuccess(data, title, areaId) {
-    const rtmpAddr = data.rtmp.addr;
-    const rtmpCode = data.rtmp.code;
-
-    // 新增：保存本次推流信息到本地用于下次对比
-    GM_setValue("bili_last_rtmp_addr", rtmpAddr);
-    GM_setValue("bili_last_rtmp_code", rtmpCode);
-
-    // 检查上次推流信息是否有变动
-    let changeTip = "";
+  async function handleStartLiveSuccess(data, title, areaId) {
+    showServerNotice(data?.notice);
+    const { addr: rtmpAddr, code: rtmpCode } = await selectStream(data);
     const prevAddr = GM_getValue("bili_prev_rtmp_addr");
     const prevCode = GM_getValue("bili_prev_rtmp_code");
-    if (prevAddr && prevCode) {
-      if (prevAddr !== rtmpAddr || prevCode !== rtmpCode) {
-        changeTip = `<div class=\"bili-tip-yellow\"><span style=\"font-weight:bold;\">注意：</span>本次推流信息与上次不同，请确认已更新到OBS等推流软件！</div>`;
-      } else {
-        changeTip = `<div class=\"bili-tip-green\"><span style=\"font-weight:bold;\">推流信息没有变动 🎉🎉</span></div>`;
-      }
-    }
-    // 更新本地上次推流信息为本次
+    streamInfo = { rtmpAddr, rtmpCode, roomId, areaId, title };
+    GM_setValue(STORAGE_KEYS.STREAM_INFO, streamInfo);
     GM_setValue("bili_prev_rtmp_addr", rtmpAddr);
     GM_setValue("bili_prev_rtmp_code", rtmpCode);
-
-    // 显示推流信息
-    const resultHTML = `
-            <div style="display: flex; flex-direction: column; gap: 8px;">
-                <h3 class="bili-title" style="font-size: 16px;">推流信息</h3>
-                <div>
-                    <p style="margin: 0; font-weight: bold;">服务器地址:</p>
-                    <div style="display: flex; align-items: center; margin-bottom: 8px;">
-                        <input id="server-addr" readonly value="${rtmpAddr}" title="${rtmpAddr}" class="bili-input" />
-                        <button id="copy-addr" class="bili-copy-btn">复制</button>
-                    </div>
-                    <p style="margin: 0; font-weight: bold;">推流码:</p>
-                    <div style="display: flex; align-items: center;">
-                        <input id="stream-code" readonly value="${rtmpCode}" title="${rtmpCode}" class="bili-input" />
-                        <button id="copy-code" class="bili-copy-btn">复制</button>
-                    </div>
-                </div>
-                ${changeTip}
-                <div class="bili-important-tip">
-                    <p style="margin: 0; font-weight: bold;">重要提示:</p>
-                    <p style="margin: 3px 0 0; font-size: 13px;">1. 长时间无信号会自动关闭直播</p>
-                    <p style="margin: 3px 0 0; font-size: 13px;">2. 推流码如果变动会有提示</p>
-                </div>
-            </div>
-        `;
-
-    const resultArea = document.getElementById("bili-result");
-    resultArea.innerHTML = resultHTML;
-    resultArea.style.display = "block";
-    // 添加复制按钮事件
-    const copyAddrBtn = document.getElementById("copy-addr");
-    if (copyAddrBtn) {
-      copyAddrBtn.addEventListener("click", function () {
-        copyToClipboardWithButton(rtmpAddr, copyAddrBtn);
-      });
+    restoreStreamInfo();
+    if (prevAddr && prevCode && (prevAddr !== rtmpAddr || prevCode !== rtmpCode)) {
+      showMessage("推流信息已变动，请更新 OBS 等推流软件中的地址和推流码");
+    } else {
+      showMessage("平台已确认开播并取得推流码；尚未验证媒体连接或播放");
     }
-    const copyCodeBtn = document.getElementById("copy-code");
-    if (copyCodeBtn) {
-      copyCodeBtn.addEventListener("click", function () {
-        copyToClipboardWithButton(rtmpCode, copyCodeBtn);
-      });
+    showServerNotice(data?.notice);
+  }
+
+  function usableStream(candidate) {
+    return candidate && typeof candidate.addr === "string" && /^rtmps?:\/\/[^\s/]+\//.test(candidate.addr) &&
+      typeof candidate.code === "string" && candidate.code.length > 0;
+  }
+
+  async function resolveNewLink(link) {
+    const url = new URL(link);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("不支持的调度 URL");
+    // 保留原始 URL 的编码和凭据；匿名发送，不追加 appkey/sign。
+    const response = await gmRequest({ method: "GET", url: link, anonymous: true, headers: await getApiHeaders() });
+    if (response.status !== 200) throw new Error(`调度 HTTP ${response.status}`);
+    let payload;
+    try {
+      payload = JSON.parse(response.responseText);
+    } catch (_) {
+      payload = response.responseText.trim();
     }
-    // 新增：推流信息区插入后，重新应用颜色模式
-    const isDarkMode = GM_getValue("bili_dark_mode", false);
-    applyColorMode(isDarkMode);
+    if (typeof payload === "string" && /^rtmps?:\/\/[^\s]+$/.test(payload)) {
+      const query = payload.indexOf("?");
+      const slash = payload.lastIndexOf("/", query < 0 ? payload.length : query);
+      const stream = { addr: payload.slice(0, slash + 1), code: payload.slice(slash + 1) };
+      if (usableStream(stream)) return stream;
+    }
+    if (payload?.code !== undefined && typeof payload.code === "number" && payload.code !== 0) {
+      throw new Error(`调度失败：${businessMessage(payload)}`);
+    }
+    const data = payload?.data ?? payload;
+    const candidates = [...(Array.isArray(data?.protocols) ? data.protocols : []), data?.rtmp, data];
+    const stream = candidates.find(usableStream);
+    if (!stream) throw new Error("调度响应中没有可用 RTMP/RTMPS 地址");
+    return stream;
+  }
 
-    // 更新按钮状态
-    updateButtonsForLive(true);
-
-    // 保存直播状态
-    isLiveStarted = true;
-    streamInfo = {
-      rtmpAddr,
-      rtmpCode,
-      roomId,
-      areaId,
-      title,
-    };
-
-    GM_setValue("isLiveStarted", true);
-    GM_setValue("streamInfo", streamInfo);
-
-    // 显示通知
-    GM_notification({
-      text: "已成功获取推流码并开始直播",
-      title: "B站推流码获取工具",
-      timeout: 5000,
-    });
+  async function selectStream(data) {
+    const candidates = [...(Array.isArray(data?.protocols) ? data.protocols : []), data?.rtmp];
+    const visited = new Set();
+    let dispatchError;
+    for (const candidate of candidates) {
+      if (!candidate || (candidate.protocol && (typeof candidate.protocol !== "string" || !["rtmp", "rtmps"].includes(candidate.protocol.toLowerCase())))) continue;
+      if (typeof candidate.new_link === "string" && candidate.new_link && !visited.has(candidate.new_link)) {
+        visited.add(candidate.new_link);
+        try {
+          return await resolveNewLink(candidate.new_link);
+        } catch (error) {
+          dispatchError = error;
+        }
+      }
+      if (usableStream(candidate)) return candidate;
+    }
+    throw new Error(dispatchError?.message || "服务端未返回可用 RTMP/RTMPS 地址（live_key 不是推流码）");
   }
 
   // 更新直播标题
   async function updateLiveTitle(roomId, title) {
-    titleData.room_id = roomId;
-    titleData.title = title;
-    titleData.csrf_token = csrf;
-    titleData.csrf = csrf;
-    try {
-      const response = await gmRequest({
-        method: "POST",
-        url: API_URL_UPDATE_ROOM,
-        headers: headers,
-        data: new URLSearchParams(titleData).toString(),
-      });
-      const result = JSON.parse(response.responseText);
-      if (result.code !== 0) {
-        console.error("Update title API error:", result);
-      }
-      return result.code === 0;
-    } catch (errorResponse) {
-      console.error("Update title request error:", errorResponse);
-      return false;
-    }
+    const token = requireCsrf();
+    await requestJson({
+      method: "POST", url: API_URL_UPDATE_ROOM,
+      data: serializeParams({ room_id: roomId, platform: "pc_link", title, csrf: token, csrf_token: token }),
+    });
+    return true;
   }
 
   // 更新直播分区
   async function updateLiveArea(roomId, areaId) {
-    areaData.room_id = roomId;
-    areaData.area_id = areaId;
-    areaData.csrf_token = csrf;
-    areaData.csrf = csrf;
-    try {
-      const response = await gmRequest({
-        method: "POST",
-        url: API_URL_UPDATE_ROOM,
-        headers: headers,
-        data: new URLSearchParams(areaData).toString(),
-      });
-      const result = JSON.parse(response.responseText);
-      if (result.code !== 0) {
-        console.error("Update area API error:", result);
-      }
-      return result.code === 0;
-    } catch (errorResponse) {
-      console.error("Update area request error:", errorResponse);
-      return false;
-    }
+    const token = requireCsrf();
+    await requestJson({
+      method: "POST", url: API_URL_UPDATE_ROOM,
+      data: serializeParams({ room_id: roomId, platform: "pc_link", area_id: areaId, csrf: token, csrf_token: token }),
+    });
+    return true;
   }
 
   // 停止直播
   async function stopLive() {
-    if (!isLiveStarted) return;
-
+    if (liveOperationPending || !(isLiveStarted || liveStatusUnknown)) return;
     if (!confirm("确定要结束直播吗？")) return;
-
-    // 设置请求参数
-    stopData.room_id = roomId;
-    stopData.csrf_token = csrf;
-    stopData.csrf = csrf;
-
+    liveOperationPending = true;
+    updateButtonsForLive(isLiveStarted);
+    let sent = false;
     try {
-      const response = await gmRequest({
-        method: "POST",
-        url: API_URL_STOP_LIVE,
-        headers: headers,
-        data: new URLSearchParams(stopData).toString(),
-      });
-      const result = JSON.parse(response.responseText);
-
-      if (result.code === 0) {
-        // 成功结束直播
-        showMessage("直播已成功结束");
-
-        // 更新按钮状态
-        updateButtonsForLive(false);
-
-        // 清除直播状态
-        isLiveStarted = false;
-        streamInfo = null;
-
-        GM_setValue("isLiveStarted", false);
-        GM_setValue("streamInfo", null);
-
-        // 隐藏推流信息区域，回到未开播状态
-        const resultArea = document.getElementById("bili-result");
-        if (resultArea) {
-          setTimeout(() => {
-            resultArea.style.display = "none";
-          }, 2000); // 2秒后隐藏，让用户看到结束成功的消息
-        }
-      } else {
-        console.error("Stop live API error:", result);
-        showMessage(`结束直播失败: ${result.message || "未知错误"}`, true);
+      const ownRoom = await getOwnRoom(roomId || String(GM_getValue(STORAGE_KEYS.LAST_ROOM_ID, "")));
+      if (ownRoom.live_status !== 1) {
+        saveLiveState(false);
+        showMessage("服务器确认房间未开播");
+        return;
       }
-    } catch (errorResponse) {
-      console.error("Stop live request error:", errorResponse);
-      let errorMessage = "网络请求失败或解析错误";
-      if (errorResponse && errorResponse.responseText) {
-        try {
-          const parsedError = JSON.parse(errorResponse.responseText);
-          errorMessage = `API错误: ${parsedError.message || "未知API错误"}`;
-        } catch (e) {}
-      } else if (errorResponse instanceof Error) {
-        errorMessage = `请求错误: ${errorResponse.message}`;
-      }
-      showMessage(errorMessage, true);
+      const requestHeaders = await getApiHeaders();
+      const body = buildStopLiveBody(roomId, requireCsrf());
+      sent = true;
+      saveLiveState(true, true);
+      const result = await requestJson({ method: "POST", url: API_URL_STOP_LIVE, headers: requestHeaders, data: body }, false);
+      saveLiveState(result.code !== 0, result.code === 0);
+      const state = await checkActualLiveStatus(true);
+      if (result.code !== 0) showMessage(`关播失败：${businessMessage(result)}`, true);
+      else if (!state) showMessage("平台已确认关播，但状态读回失败；请重新打开面板查询", true);
+      else showMessage(isLiveStarted ? "关播已受理，但房间仍在直播，请在官方中心确认" : "直播已结束，已读回服务器状态", isLiveStarted);
+    } catch (error) {
+      if (sent) await checkActualLiveStatus(true);
+      showMessage(`${sent ? "关播请求结果未知，未自动重发" : "关播已停止"}：${error.message}`, true);
+    } finally {
+      liveOperationPending = false;
+      updateButtonsForLive(isLiveStarted);
     }
   }
 
@@ -1924,9 +1943,10 @@
       showStatusInStreamInfo(message, isError);
     } else if (resultArea) {
       // 未开播时，正常显示消息
-      resultArea.innerHTML = `<p class="bili-message${
-        isError ? " bili-message-error" : ""
-      }">${message}</p>`;
+      const text = document.createElement("p");
+      text.className = `bili-message${isError ? " bili-message-error" : ""}`;
+      text.textContent = message;
+      resultArea.replaceChildren(text);
       resultArea.style.display = "block";
     }
 
