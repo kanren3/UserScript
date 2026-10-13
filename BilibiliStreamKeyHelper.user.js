@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站推流码获取工具
 // @namespace    https://github.com/smathsp
-// @version      1.15
+// @version      1.16
 // @description  获取第三方推流码
 // @author       smathsp
 // @license      GPL-3.0
@@ -45,8 +45,9 @@
   };
 
   // API URL Constants
+  // 公开分区目录：无需登录和签名；返回父分区数组，子项 id 即 startLive 的 area_v2。
   const API_URL_AREA_LIST =
-    "https://api.live.bilibili.com/xlive/app-blink/v1/preLive/GetAreaListForLive";
+    "https://api.live.bilibili.com/room/v1/Area/getList";
   const API_URL_START_LIVE =
     "https://api.live.bilibili.com/room/v1/Room/startLive";
   const API_URL_UPDATE_ROOM =
@@ -1001,10 +1002,8 @@
       try {
         let list = getCachedAreaList();
         if (!list) {
-          const result = await signedRequest("GET", API_URL_AREA_LIST, {
-            current_area_id: String(GM_getValue(STORAGE_KEYS.LAST_AREA_ID, "0")),
-          });
-          list = Array.isArray(result.data) ? result.data : result.data?.list;
+          const result = await requestJson({ method: "GET", url: API_URL_AREA_LIST });
+          list = result.data;
           if (!Array.isArray(list) || !list.every((group) => Array.isArray(group.list))) {
             throw new Error("分区目录格式异常");
           }
